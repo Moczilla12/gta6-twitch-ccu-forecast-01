@@ -1,18 +1,33 @@
 """Forecast Twitch concurrent viewers for a launch day's hours 2..24.
 
-Idea: a big launch's day-1 curve looks a lot like other big launches' day-1
-curves once you anchor on the first hour. For each past launch we know how
-its hourly viewers moved away from its own hour 1 (in log space); the
-forecast for a new launch takes the median of those moves across a filtered
-set of similar launches, then widens the outer quantiles by a fixed factor
-so the band stays honest about how different launches really are.
+Model (v2): peak-amplitude + shape decomposition, fit on similar past launches.
 
-The filter keeps only launches that behaved like a clean console launch:
-no early-access contamination, no weak tier, a late peak (hour 10 or
-later), a peak a few times the first hour, and a big jump from the
-pre-release baseline. If too few launches survive, the filter is relaxed
-step by step; if almost none survive, the forecast falls back to
-persistence (stay at hour 1, spread widening like a random walk).
+    log v(h) = log h1 + G * s(h)
+
+where G = log(peak / hour-1) is the launch's total log-growth and s(h) is the
+normalised shape (0 at hour 1, 1 at the peak).  Two things are estimated
+from the training launches (the case's comparables that look like clean
+rolling-midnight console launches):
+
+  * G is predicted from the target's own hour-1 level: log(peak/h1) falls
+    almost linearly with log(h1) (bigger first hour -> the world is already
+    watching -> less room to grow).  The prediction is an OLS fit shrunk
+    75% toward the median G, with the hour-1 level clipped to the range of
+    launches seen ([10k, 400k]) and G floored at log(1.2): a rolling-midnight
+    launch's peak must exceed its first hour (the US has not unlocked yet),
+    and no line fitted on past launches is trusted past the biggest one.
+  * s(h) is the median normalised shape across training launches, lightly
+    smoothed over neighbouring hours.
+
+Quantiles come from honest leave-one-out residuals of the same procedure:
+for each training launch, fit on the others, predict it, and record the
+log-residual per hour.  The forecast's quantiles are the median curve
+shifted by those residual quantiles, so the band is as wide as past
+launches really were hard to predict -- no wider, no narrower.
+
+If too few clean launches survive, fall back to every clean launch; if
+still too few, fall back to persistence (stay at hour 1, spread widening
+like a random walk).
 
 Only the Python standard library is used, there is no network access and
 nothing is random, so two runs on the same case write identical bytes.
@@ -36,14 +51,18 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
 # Log-space spread of one hour's move in the persistence fallback.
 FALLBACK_SIGMA = 0.15
-# How much wider than the raw cross-launch spread the outer quantiles sit.
-SPREAD_FACTOR = 1.2
 # Hours of a launch's day, 1-indexed.
 DAY_HOURS = range(1, 25)
 FORECAST_HOURS = range(2, 25)
 # Pre-release baseline window, in hours before day_start: [-336, -24).
 BASELINE_START = -336
 BASELINE_END = -24
+# G-model: shrink of the OLS prediction toward the median G.
+G_SHRINK = 0.75
+# G-model: clip log(hour-1) to the launches seen, and floor G at log(1.2).
+G_LOG_H1_LO = math.log(10000)
+G_LOG_H1_HI = math.log(400000)
+G_FLOOR = math.log(1.2)
 
 
 def parse_time(text):
@@ -159,54 +178,113 @@ def launch_peak(release):
     return best_value, best_hour
 
 
-def pick_training_set(clean, target_surge):
-    """Choose the launches whose day-1 shapes anchor the forecast.
+def is_class_b(shape):
+    """A clean rolling-midnight launch that builds through the day.
 
-    `clean` is a list of (release-day dict, surge) for tier-clean launches.
-    Tight first; loosen the peak-ratio cap when too few survive; fall back
-    to every clean launch; None means persistence for the whole case.
-    A target whose first hour shows no launch yet (small surge) uses the
-    loose set straight away.
+    Same rule the offline validation used: a big surge from the pre-release
+    baseline, a late peak (hour 10 or later), and a peak a few times the
+    first hour -- but not hundreds of times (that is a launch whose day
+    really starts later, not a midnight one).
     """
-    tight, loose = [], []
-    for release, surge in clean:
-        peak, peak_hour = launch_peak(release)
-        first = release[1]
-        ratio = peak / max(1, first)
-        if surge is not None and surge <= 4:
-            continue
-        if peak_hour < 10 or ratio < 1.2:
-            continue
-        if ratio <= 5.0:
-            tight.append(release)
-        if ratio <= 15.0:
-            loose.append(release)
-    pool = loose if (target_surge is not None and target_surge < 2.0) else tight
-    if len(pool) < 8 and pool is tight:
-        pool = loose
-    if len(pool) < 5:
-        pool = [release for release, _surge in clean]
-    if len(pool) < 3:
-        return None
-    return pool
+    release, surge = shape
+    if surge is not None and surge <= 4:
+        return False
+    peak, peak_hour = launch_peak(release)
+    first = release[1]
+    ratio = peak / max(1, first)
+    return peak_hour >= 10 and 1.2 <= ratio <= 15.0
 
 
-def target_surge(case, day_start, p1):
-    """The target's own surge from its pre-release baseline, if computable."""
-    points = case.get("history") or case.get("history_hourly") or []
-    baseline_logs = []
-    for point in points:
-        try:
-            stamp = point.get("at") or point.get("from")
-            viewers = point["viewers"]
-            offset = hour_offset(parse_time(stamp), day_start)
-        except (KeyError, TypeError, ValueError):
+def ols(xs, ys):
+    """Least-squares line; returns (intercept, slope)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return my, 0.0
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return my - slope * mx, slope
+
+
+def growth_of(release):
+    """Total log-growth log(peak / hour-1) of one launch's release day."""
+    peak, _hour = launch_peak(release)
+    return math.log(peak / max(1, release[1] or 1))
+
+
+def shape_of(release):
+    """Normalised shape s(h) = (log v(h) - log h1) / G, 0 at hour 1."""
+    total = growth_of(release)
+    first = max(1, release[1] or 1)
+    out = {}
+    for hour in DAY_HOURS:
+        value = release.get(hour)
+        if value is None or total <= 0:
+            out[hour] = None
+        else:
+            out[hour] = (math.log(value) - math.log(first)) / total
+    return out
+
+
+def fit_g_model(training):
+    """(intercept, slope, median G, shrink) for log(peak/h1) on log(h1)."""
+    xs = [math.log(max(1, release[1] or 1)) for release, _surge in training]
+    ys = [growth_of(release) for release, _surge in training]
+    intercept, slope = ols(xs, ys)
+    return (intercept, slope, median(ys), G_SHRINK)
+
+
+def predict_g(g_model, p1):
+    """Total log-growth for a target whose first hour printed p1."""
+    intercept, slope, med, shrink = g_model
+    clipped = min(max(math.log(max(1, p1)), G_LOG_H1_LO), G_LOG_H1_HI)
+    raw = intercept + slope * clipped
+    return max(G_FLOOR, med + shrink * (raw - med))
+
+
+def fit_shape(training):
+    """Median normalised shape per hour, lightly smoothed over neighbours."""
+    shapes = {hour: [] for hour in DAY_HOURS}
+    for release, _surge in training:
+        shape = shape_of(release)
+        for hour in DAY_HOURS:
+            if shape[hour] is not None:
+                shapes[hour].append(shape[hour])
+    med = {}
+    for hour in DAY_HOURS:
+        values = shapes[hour]
+        med[hour] = median(values) if values else (0.0 if hour == 1 else 1.0)
+    smoothed = {}
+    for hour in DAY_HOURS:
+        neighbours = [med[h] for h in range(max(1, hour - 1), min(24, hour + 1) + 1)]
+        smoothed[hour] = sum(neighbours) / len(neighbours)
+    smoothed[1] = 0.0
+    return smoothed
+
+
+def median_curve(training, p1):
+    """The median forecast curve (dict hour -> viewers) for a target."""
+    g_model = fit_g_model(training)
+    shape = fit_shape(training)
+    total = max(0.0, predict_g(g_model, p1))
+    return {hour: p1 * math.exp(total * shape[hour]) for hour in DAY_HOURS}
+
+
+def loo_residuals(training):
+    """Honest leave-one-out log-residuals of the same procedure, per hour."""
+    resid = {hour: [] for hour in FORECAST_HOURS}
+    for index, held in enumerate(training):
+        sub = training[:index] + training[index + 1:]
+        if len(sub) < 3:
             continue
-        if BASELINE_START <= offset < BASELINE_END and viewers and viewers > 0:
-            baseline_logs.append(math.log(viewers))
-    if not baseline_logs or p1 <= 0:
-        return None
-    return math.log(p1) - median(baseline_logs)
+        release, _surge = held
+        curve = median_curve(sub, max(1, release[1] or 1))
+        for hour in FORECAST_HOURS:
+            value = release.get(hour)
+            if value:
+                resid[hour].append(math.log(value) - math.log(max(1e-9, curve[hour])))
+    return resid
 
 
 def requested_hours(case):
@@ -236,30 +314,31 @@ def forecast_case(case):
         shape = launch_shape(comp)
         if shape is not None:
             clean.append(shape)
-    surge = target_surge(case, day_start, p1)
-    training = pick_training_set(clean, surge)
+    training = [shape for shape in clean if is_class_b(shape)]
+    if len(training) < 3:
+        training = clean
+    if len(training) < 3:
+        training = None
 
-    log_p1 = math.log(p1)
     rows = []
+    if training is None:
+        for hour in requested_hours(case):
+            rows.append({"hour": hour, "q": persistence_row(p1, hour)})
+        return {"hours": rows}
+
+    med_curve = median_curve(training, p1)
+    resid = loo_residuals(training)
     for hour in requested_hours(case):
-        if training is None:
+        values = resid.get(hour) or []
+        if len(values) < 3:
             rows.append({"hour": hour, "q": persistence_row(p1, hour)})
             continue
-        moves = []
-        for release in training:
-            first_hour = release.get(1)
-            later = release.get(hour)
-            if first_hour and first_hour > 0 and later and later > 0:
-                moves.append(math.log(later / first_hour))
-        if len(moves) < 3:
-            rows.append({"hour": hour, "q": persistence_row(p1, hour)})
-            continue
-        centre = quantile_interp(moves, 0.5)
-        values = []
+        med_resid = median(values)
+        quantiles = []
         for tau in LEVELS:
-            edge = quantile_interp(moves, tau)
-            values.append(math.exp(log_p1 + centre + SPREAD_FACTOR * (edge - centre)))
-        rows.append({"hour": hour, "q": clean_row(p1, hour, values)})
+            edge = quantile_interp(values, tau)
+            quantiles.append(med_curve[hour] * math.exp(med_resid + (edge - med_resid)))
+        rows.append({"hour": hour, "q": clean_row(p1, hour, quantiles)})
     return {"hours": rows}
 
 
